@@ -284,20 +284,65 @@ with qna_tab:
 with mcq_tab:
     st.header("Generate MCQs from PDF Concepts")
     num_questions = st.slider("Number of MCQs", 1, 10, 5)
+
+    # Button to generate MCQs
     if st.button("Generate MCQs") and st.session_state.processed_pdf:
         context = " ".join(st.session_state.context_chunks) if st.session_state.context_chunks else st.session_state.text
         mcq_text = generate_mcqs_from_context(context, num_questions)
         if mcq_text:
             questions = parse_mcqs(mcq_text)
-            for i, q in enumerate(questions):
-                st.markdown(f"*Q{i+1}: {q['question']}*")
-                st.markdown(f"A) {q['options'][0]}")
-                st.markdown(f"B) {q['options'][1]}")
-                st.markdown(f"C) {q['options'][2]}")
-                st.markdown(f"D) {q['options'][3]}")
-                st.markdown('---')
+            if questions:
+                st.session_state.mcq_questions = questions
+                st.session_state.user_mcq_answers = [None] * len(questions)
+                st.session_state.mcq_submitted = False
+            else:
+                st.warning("No MCQs could be parsed.")
         else:
             st.warning("No MCQs could be generated.")
+
+    # Only display MCQs if they exist in session state
+    if 'mcq_questions' in st.session_state and st.session_state.mcq_questions:
+        questions = st.session_state.mcq_questions
+        for i, q in enumerate(questions):
+            st.markdown(f"**Q{i+1}: {q['question']}**")
+            st.session_state.user_mcq_answers[i] = st.radio(
+                "Select your answer:",
+                options=['A', 'B', 'C', 'D'],
+                key=f"mcq_{i}"
+            )
+            st.markdown(f"A) {q['options'][0]}")
+            st.markdown(f"B) {q['options'][1]}")
+            st.markdown(f"C) {q['options'][2]}")
+            st.markdown(f"D) {q['options'][3]}")
+            st.markdown('---')
+
+        # Submit button
+        if st.button("Submit Quiz"):
+            st.session_state.mcq_submitted = True
+
+        # Show score and feedback only after submission
+        if st.session_state.get('mcq_submitted', False):
+            score = 0
+            questions = st.session_state.mcq_questions
+            user_answers = st.session_state.user_mcq_answers
+            for i, q in enumerate(questions):
+                is_correct = user_answers[i] == q['answer']
+                st.markdown(f"**Q{i+1}: {q['question']}**")
+                for idx, opt in enumerate(['A', 'B', 'C', 'D']):
+                    option_text = f"{opt}) {q['options'][idx]}"
+                    if user_answers[i] == opt:
+                        if is_correct:
+                            st.markdown(f"<span style='color: green; font-weight: bold'>Your answer: {option_text} ✔️</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<span style='color: red; font-weight: bold'>Your answer: {option_text} ❌</span>", unsafe_allow_html=True)
+                    elif not is_correct and q['answer'] == opt:
+                        st.markdown(f"<span style='color: green; font-weight: bold'>Correct answer: {option_text} ✔️</span>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"{option_text}")
+                st.markdown('---')
+                if is_correct:
+                    score += 1
+            st.success(f"Your score: {score}/{len(questions)}")
 
 # Cleanup when the app is closed
 if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path):
