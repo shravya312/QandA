@@ -100,7 +100,7 @@ def setup_collection():
 
 def upload_to_qdrant(chunks, embeddings):
     """Upload data to Qdrant"""
-    if not chunks or embeddings is None or (isinstance(embeddings, np.ndarray) and embeddings.size == 0) or (hasattr(embeddings, '__len__') and len(embeddings) == 0):
+    if not chunks or embeddings is None or (isinstance(embeddings, np.ndarray) and embeddings.size == 0) or (hasattr(embeddings, '_len_') and len(embeddings) == 0):
         return False
     
     try:
@@ -291,7 +291,7 @@ with mcq_tab:
         if mcq_text:
             questions = parse_mcqs(mcq_text)
             for i, q in enumerate(questions):
-                st.markdown(f"**Q{i+1}: {q['question']}**")
+                st.markdown(f"*Q{i+1}: {q['question']}*")
                 st.markdown(f"A) {q['options'][0]}")
                 st.markdown(f"B) {q['options'][1]}")
                 st.markdown(f"C) {q['options'][2]}")
