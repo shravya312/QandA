@@ -239,6 +239,19 @@ if 'chunks' not in st.session_state:
 
 pdf = st.file_uploader("Upload a PDF file", type=["pdf"])
 
+# Detect if a new PDF is uploaded and reset session state
+if pdf is not None:
+    if 'last_uploaded_filename' not in st.session_state or st.session_state.last_uploaded_filename != pdf.name:
+        st.session_state.processed_pdf = False
+        st.session_state.pdf_path = None
+        st.session_state.context_chunks = []
+        st.session_state.text = None
+        st.session_state.chunks = []
+        st.session_state.mcq_questions = []
+        st.session_state.user_mcq_answers = []
+        st.session_state.mcq_submitted = False
+        st.session_state.last_uploaded_filename = pdf.name
+
 if pdf and not st.session_state.processed_pdf:
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, "uploaded.pdf")
