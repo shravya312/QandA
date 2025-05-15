@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 import tempfile
 import shutil
 import numpy as np
-import graphviz
 import re
 
 # ===== Load Environment Variables =====
