@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 import tempfile
 import shutil
 import numpy as np
+import graphviz
+import re
 
 # ===== Load Environment Variables =====
 load_dotenv()
@@ -133,12 +135,92 @@ def generate_answer_from_gemini(query, context):
     if not query or not context:
         return "Please provide both a question and context."
     
-    prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+    marks_match = re.search(r'(\d+)\s*marks', query, re.IGNORECASE)
+    if marks_match:
+        marks = int(marks_match.group(1))
+        if marks >= 8:
+            extra_instruction = (
+                "This is a high-mark question. Write a long, detailed, and well-structured answer. "
+                "Include introduction, step-by-step explanation, algorithm, math, advantages, disadvantages, applications, and examples."
+            )
+        elif marks >= 5:
+            extra_instruction = (
+                "This is a medium-mark question. Write a moderately detailed answer with explanation, steps, and at least one example."
+            )
+        else:
+            extra_instruction = (
+                "This is a short-mark question. Write a concise answer."
+            )
+    else:
+        extra_instruction = ""
+
+    prompt = (
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        f"Instructions: {extra_instruction}\n\n"
+        f"Answer:"
+    )
     try:
         response = gemini_model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         return f"❌ Error from Gemini: {str(e)}"
+
+def generate_mcqs_from_context(context, num_questions=5):
+    """
+    Use the LLM to generate MCQs from the context.
+    """
+    prompt = (
+        f"Generate {num_questions} multiple choice questions (MCQs) from the following context. "
+        f"For each question, use this format:\n"
+        f"Q: <question text>\n"
+        f"A) <option 1>\n"
+        f"B) <option 2>\n"
+        f"C) <option 3>\n"
+        f"D) <option 4>\n"
+        f"Answer: <A/B/C/D>\n\n"
+        f"Context:\n{context}\n"
+    )
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Error generating MCQs: {e}")
+        return None
+
+def parse_mcqs(mcq_text):
+    """
+    Parse the MCQ text into a list of dicts.
+    """
+    questions = []
+    blocks = re.split(r'\n(?=Q: )', mcq_text)
+    for block in blocks:
+        q = {}
+        lines = block.strip().split('\n')
+        if len(lines) < 6:
+            continue
+        q['question'] = lines[0][3:].strip()
+        q['options'] = [line[3:].strip() for line in lines[1:5]]
+        answer_line = lines[5]
+        q['answer'] = answer_line.split(':')[-1].strip()
+        questions.append(q)
+    return questions
+
+def generate_flowchart_from_context(context, topic):
+    """
+    Use the LLM to generate a flowchart description in DOT language.
+    """
+    prompt = (
+        f"Given the following context from a textbook or manual, generate a flowchart in Graphviz DOT format "
+        f"for the topic: '{topic}'. Only output the DOT code, nothing else.\n\n"
+        f"Context:\n{context}\n"
+    )
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Error generating flowchart: {e}")
+        return None
 
 # ===== Streamlit UI =====
 st.set_page_config(layout="wide")
@@ -149,27 +231,29 @@ if 'processed_pdf' not in st.session_state:
     st.session_state.processed_pdf = False
 if 'pdf_path' not in st.session_state:
     st.session_state.pdf_path = None
+if 'context_chunks' not in st.session_state:
+    st.session_state.context_chunks = []
+if 'text' not in st.session_state:
+    st.session_state.text = None
+if 'chunks' not in st.session_state:
+    st.session_state.chunks = []
 
 pdf = st.file_uploader("Upload a PDF file", type=["pdf"])
-question = st.text_input("Ask a question based on the PDF content:")
 
 if pdf and not st.session_state.processed_pdf:
-    # Create a temporary file to store the PDF
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, "uploaded.pdf")
-    
     try:
         with open(temp_path, "wb") as f:
             f.write(pdf.read())
-        
         st.session_state.pdf_path = temp_path
         st.info("⏳ Extracting and processing PDF...")
-        
         text = extract_text_from_pdf(temp_path)
+        st.session_state.text = text
         if text:
             chunks = chunk_text(text)
+            st.session_state.chunks = chunks
             embeddings = get_embeddings(chunks)
-            
             if setup_collection() and upload_to_qdrant(chunks, embeddings):
                 st.session_state.processed_pdf = True
                 st.success("✅ PDF processed and indexed.")
@@ -181,17 +265,40 @@ if pdf and not st.session_state.processed_pdf:
             shutil.rmtree(os.path.dirname(st.session_state.pdf_path))
             st.session_state.pdf_path = None
 
-if question and st.session_state.processed_pdf:
-    st.info("🔍 Searching for relevant information...")
-    query_vector = model.encode([question])[0]
-    context_chunks = search_chunks(query_vector)
-    context = " ".join(context_chunks)
+# Tabs for Q&A and MCQ only (remove Flowchart Generation tab)
+qna_tab, mcq_tab = st.tabs(["PDF Q&A", "MCQ Generation"])
 
-    st.info("🤖 Generating answer from Gemini...")
-    answer = generate_answer_from_gemini(question, context)
+with qna_tab:
+    st.header("Ask a Question from the PDF")
+    question = st.text_input("Ask a question based on the PDF content:")
+    if question and st.session_state.processed_pdf:
+        st.info("🔍 Searching for relevant information...")
+        query_vector = model.encode([question])[0]
+        context_chunks = search_chunks(query_vector)
+        st.session_state.context_chunks = context_chunks
+        context = " ".join(context_chunks)
+        st.info("🤖 Generating answer from Gemini...")
+        answer = generate_answer_from_gemini(question, context)
+        st.subheader("🧠 Answer:")
+        st.write(answer)
 
-    st.subheader("🧠 Answer:")
-    st.write(answer)
+with mcq_tab:
+    st.header("Generate MCQs from PDF Concepts")
+    num_questions = st.slider("Number of MCQs", 1, 10, 5)
+    if st.button("Generate MCQs") and st.session_state.processed_pdf:
+        context = " ".join(st.session_state.context_chunks) if st.session_state.context_chunks else st.session_state.text
+        mcq_text = generate_mcqs_from_context(context, num_questions)
+        if mcq_text:
+            questions = parse_mcqs(mcq_text)
+            for i, q in enumerate(questions):
+                st.markdown(f"**Q{i+1}: {q['question']}**")
+                st.markdown(f"A) {q['options'][0]}")
+                st.markdown(f"B) {q['options'][1]}")
+                st.markdown(f"C) {q['options'][2]}")
+                st.markdown(f"D) {q['options'][3]}")
+                st.markdown('---')
+        else:
+            st.warning("No MCQs could be generated.")
 
 # Cleanup when the app is closed
 if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path):
