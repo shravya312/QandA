@@ -368,6 +368,22 @@ def re_rank_chunks(query_text, candidate_chunks, top_k=5):
     # Return top_k re-ranked chunks
     return [chunk for chunk, score in scored_chunks[:top_k]]
 
+def expand_query(query, num_terms=3):
+    """Expands the user query with additional terms using Gemini."""
+    prompt = (
+        f"Generate {num_terms} related terms or short phrases for the following query. "
+        f"Output only the terms, separated by commas, no other text.\n"
+        f"Query: {query}\n"
+        f"Related terms:"
+    )
+    try:
+        response = gemini_model.generate_content(prompt)
+        expanded_terms = [term.strip() for term in response.text.strip().split(',') if term.strip()]
+        return " ".join(expanded_terms) # Return as a space-separated string
+    except Exception as e:
+        st.warning(f"Error expanding query: {e}")
+        return ""
+
 def generate_answer_from_gemini(query, context):
     """Use Gemini to answer the question"""
     if not query or not context:
@@ -592,16 +608,19 @@ with qna_tab:
     st.header("Ask a Question from the PDF")
     question = st.text_input("Ask a question based on the PDF content:")
     if question and st.session_state.processed_pdf:
+        st.info("✨ Expanding query...")
+        expanded_terms = expand_query(question)
+        expanded_query_text = f"{question} {expanded_terms}".strip()
         
         st.info("🔍 Searching for relevant information...")
-        query_vector = model.encode([question])[0]
+        # query_vector = model.encode([question])[0] # No longer needed, search_chunks takes text
         current_pdf_hash = st.session_state.get('pdf_hash')
         
         # Perform hybrid search to get candidate chunks
-        candidate_chunks = search_chunks(question, current_pdf_hash) if current_pdf_hash else []
+        candidate_chunks = search_chunks(expanded_query_text, current_pdf_hash) if current_pdf_hash else []
         
         # Re-rank the candidate chunks
-        re_ranked_chunks = re_rank_chunks(question, candidate_chunks, top_k=5)
+        re_ranked_chunks = re_rank_chunks(expanded_query_text, candidate_chunks, top_k=5)
         
         st.session_state.context_chunks = re_ranked_chunks
         context = " ".join(re_ranked_chunks)
