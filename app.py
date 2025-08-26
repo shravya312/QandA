@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
@@ -11,6 +11,8 @@ import tempfile
 import shutil
 import numpy as np
 import re
+import hashlib
+import uuid
 
 # ===== Load Environment Variables =====
 load_dotenv()
@@ -49,8 +51,19 @@ except Exception as e:
 COLLECTION_NAME = "pdf_collection"
 VECTOR_SIZE = 384
 CHUNK_SIZE = 1000
+MIN_SIMILARITY_SCORE = 0.62  # Only accept chunks at/above this score
 
 # ===== Core Functions =====
+def generate_pdf_hash(pdf_file_path):
+    """Generate a unique hash for the PDF file based on its content"""
+    try:
+        with open(pdf_file_path, 'rb') as f:
+            file_content = f.read()
+        return hashlib.md5(file_content).hexdigest()
+    except Exception as e:
+        st.error(f"Error generating PDF hash: {str(e)}")
+        return None
+
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF"""
     try:
@@ -77,36 +90,176 @@ def get_embeddings(chunks):
         st.error(f"Error generating embeddings: {str(e)}")
         return None
 
+def is_valid_embeddings(embeddings):
+    """Check if embeddings are valid and not empty"""
+    if embeddings is None:
+        return False
+    if isinstance(embeddings, np.ndarray):
+        return embeddings.size > 0
+    if hasattr(embeddings, '_len_'):
+        return len(embeddings) > 0
+    return False
+
 def setup_collection():
-    """Recreate Qdrant collection"""
+    """Create Qdrant collection if it doesn't exist"""
+    try:
+        # Check if collection exists
+        collections = qdrant_client.get_collections()
+        collection_exists = any(col.name == COLLECTION_NAME for col in collections.collections)
+        
+        if not collection_exists:
+            qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(
+                    size=VECTOR_SIZE,
+                    distance=Distance.COSINE
+                )
+            )
+            st.info(f"Created new collection: {COLLECTION_NAME}")
+        else:
+            st.info(f"Using existing collection: {COLLECTION_NAME}")
+        
+        # Create index for pdf_hash field if it doesn't exist
+        try:
+            qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name="pdf_hash",
+                field_schema=PayloadSchemaType.KEYWORD
+            )
+        except Exception:
+            # Index might already exist, which is fine
+            pass
+        
+        return True
+    except Exception as e:
+        st.error(f"Error setting up collection: {str(e)}")
+        return False
+
+def check_pdf_embeddings_exist(pdf_hash):
+    """Check if embeddings for a PDF already exist in Qdrant"""
+    try:
+        result = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="pdf_hash",
+                        match=MatchValue(value=pdf_hash)
+                    )
+                ]
+            ),
+            limit=1
+        )
+        return len(result[0]) > 0
+    except Exception as e:
+        st.warning(f"Error checking existing embeddings: {str(e)}")
+        return False
+
+def get_existing_embeddings(pdf_hash):
+    """Retrieve existing chunks for a PDF from Qdrant (no vectors needed)."""
+    try:
+        result = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="pdf_hash",
+                        match=MatchValue(value=pdf_hash)
+                    )
+                ]
+            ),
+            with_vectors=False,
+            limit=10000  # Large limit to get all chunks
+        )
+        
+        if result[0]:
+            # Sort by id to maintain chunk order
+            sorted_points = sorted(result[0], key=lambda x: x.id)
+            chunks = [point.payload.get("text", "") for point in sorted_points]
+            return chunks, None
+        return [], None
+    except Exception as e:
+        st.error(f"Error retrieving existing embeddings: {str(e)}")
+        return [], None
+
+def clear_all_embeddings():
+    """Clear all embeddings from Qdrant collection"""
     try:
         qdrant_client.delete_collection(COLLECTION_NAME)
+        st.success("All embeddings cleared successfully.")
+        return True
     except Exception as e:
-        st.warning(f"Could not delete existing collection: {str(e)}")
-    
+        st.error(f"Error clearing embeddings: {str(e)}")
+        return False
+
+def recreate_collection_with_schema():
+    """Recreate collection with proper payload schema"""
     try:
-        qdrant_client.recreate_collection(
+        # Delete existing collection
+        try:
+            qdrant_client.delete_collection(COLLECTION_NAME)
+        except:
+            pass  # Collection might not exist
+        
+        # Create new collection
+        qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(
                 size=VECTOR_SIZE,
                 distance=Distance.COSINE
             )
         )
+        
+        # Create index for pdf_hash field
+        qdrant_client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="pdf_hash",
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+
+        # Validate index works by performing a filtered scroll (limit 1)
+        try:
+            qdrant_client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="pdf_hash",
+                            match=MatchValue(value="_validation_check_")
+                        )
+                    ]
+                ),
+                with_vectors=False,
+                limit=1
+            )
+        except Exception as validation_error:
+            st.error(f"Validation after recreation failed. The index may not be active yet: {validation_error}")
+            return False
+
+        st.success("Collection recreated and pdf_hash index validated.")
         return True
     except Exception as e:
-        st.error(f"Error setting up collection: {str(e)}")
+        st.error(f"Error recreating collection: {str(e)}")
         return False
 
-def upload_to_qdrant(chunks, embeddings):
-    """Upload data to Qdrant"""
-    if not chunks or embeddings is None or (isinstance(embeddings, np.ndarray) and embeddings.size == 0) or (hasattr(embeddings, '_len_') and len(embeddings) == 0):
+def upload_to_qdrant(chunks, embeddings, pdf_hash):
+    """Upload data to Qdrant with PDF hash for identification"""
+    if not chunks or not is_valid_embeddings(embeddings):
         return False
     
     try:
-        points = [
-            PointStruct(id=i, vector=embedding, payload={"text": chunk})
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-        ]
+        # Ensure vectors are plain Python lists of floats and provide stable string ids
+        points = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            vector_list = embedding.tolist() if isinstance(embedding, np.ndarray) else list(embedding)
+            point_id = uuid.uuid5(uuid.NAMESPACE_DNS, f"{pdf_hash}-{i}")
+            points.append(
+                PointStruct(
+                    id=str(point_id),
+                    vector=vector_list,
+                    payload={"text": chunk, "pdf_hash": pdf_hash}
+                )
+            )
         qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
             points=points
@@ -225,6 +378,36 @@ def generate_flowchart_from_context(context, topic):
 st.set_page_config(layout="wide")
 st.title("📄 PDF Question Answering System with RAG")
 
+# Sidebar for additional options
+with st.sidebar:
+    st.header("🔧 Options")
+    if st.button("🗑 Clear All Embeddings", help="This will delete all stored embeddings from Qdrant"):
+        if clear_all_embeddings():
+            st.session_state.processed_pdf = False
+            st.session_state.pdf_path = None
+            st.session_state.context_chunks = []
+            st.session_state.text = None
+            st.session_state.chunks = []
+            st.rerun()
+    
+    if st.button("🔄 Recreate Collection", help="Recreate collection with proper schema (fixes index errors)"):
+        if recreate_collection_with_schema():
+            st.session_state.processed_pdf = False
+            st.session_state.pdf_path = None
+            st.session_state.context_chunks = []
+            st.session_state.text = None
+            st.session_state.chunks = []
+            st.rerun()
+    
+    st.header("ℹ Information")
+    st.info("""
+    *How it works:*
+    - Each PDF gets a unique hash based on its content
+    - Embeddings are stored with this hash as a key
+    - If you upload the same PDF again, existing embeddings are reused
+    - This saves time and computational resources
+    """)
+
 # Initialize session state
 if 'processed_pdf' not in st.session_state:
     st.session_state.processed_pdf = False
@@ -259,18 +442,52 @@ if pdf and not st.session_state.processed_pdf:
         with open(temp_path, "wb") as f:
             f.write(pdf.read())
         st.session_state.pdf_path = temp_path
-        st.info("⏳ Extracting and processing PDF...")
-        text = extract_text_from_pdf(temp_path)
-        st.session_state.text = text
-        if text:
-            chunks = chunk_text(text)
-            st.session_state.chunks = chunks
-            embeddings = get_embeddings(chunks)
-            if setup_collection() and upload_to_qdrant(chunks, embeddings):
-                st.session_state.processed_pdf = True
-                st.success("✅ PDF processed and indexed.")
+        
+        # Generate PDF hash for identification
+        pdf_hash = generate_pdf_hash(temp_path)
+        if not pdf_hash:
+            st.error("Failed to generate PDF hash.")
+        else:
+            st.info("⏳ Checking for existing embeddings...")
+            
+            # Check if embeddings already exist
+            should_upload = True
+            if check_pdf_embeddings_exist(pdf_hash):
+                st.info("📚 Found existing embeddings for this PDF. Loading from Qdrant...")
+                chunks, embeddings = get_existing_embeddings(pdf_hash)
+                if chunks:
+                    st.session_state.chunks = chunks
+                    st.session_state.processed_pdf = True
+                    st.success("✅ PDF embeddings loaded from existing data.")
+                    # We already have data in Qdrant, no need to upload again
+                    should_upload = False
+                else:
+                    st.warning("Existing embeddings found but couldn't retrieve them. Processing PDF again...")
+                    # Fall through to normal processing
+                    chunks, embeddings = None, None
             else:
-                st.error("Failed to process and index PDF.")
+                chunks, embeddings = None, None
+            
+            # If no existing embeddings, process the PDF
+            if not chunks or not is_valid_embeddings(embeddings):
+                st.info("⏳ Extracting and processing PDF...")
+                text = extract_text_from_pdf(temp_path)
+                st.session_state.text = text
+                if text:
+                    chunks = chunk_text(text)
+                    st.session_state.chunks = chunks
+                    embeddings = get_embeddings(chunks)
+            
+            # Upload to Qdrant only if we created new embeddings in this run
+            if should_upload and chunks and is_valid_embeddings(embeddings) and setup_collection():
+                if upload_to_qdrant(chunks, embeddings, pdf_hash):
+                    st.session_state.processed_pdf = True
+                    st.success("✅ PDF processed and indexed.")
+                else:
+                    st.error("Failed to upload embeddings to Qdrant.")
+            elif not st.session_state.processed_pdf and (not chunks or not is_valid_embeddings(embeddings)):
+                st.error("Failed to process PDF.")
+            
     except Exception as e:
         st.error(f"Error processing PDF: {str(e)}")
         if st.session_state.pdf_path:
@@ -317,7 +534,7 @@ with mcq_tab:
     if 'mcq_questions' in st.session_state and st.session_state.mcq_questions:
         questions = st.session_state.mcq_questions
         for i, q in enumerate(questions):
-            st.markdown(f"**Q{i+1}: {q['question']}**")
+            st.markdown(f"Q{i+1}: {q['question']}")
             st.session_state.user_mcq_answers[i] = st.radio(
                 "Select your answer:",
                 options=['A', 'B', 'C', 'D'],
@@ -340,16 +557,16 @@ with mcq_tab:
             user_answers = st.session_state.user_mcq_answers
             for i, q in enumerate(questions):
                 is_correct = user_answers[i] == q['answer']
-                st.markdown(f"**Q{i+1}: {q['question']}**")
+                st.markdown(f"Q{i+1}: {q['question']}")
                 for idx, opt in enumerate(['A', 'B', 'C', 'D']):
                     option_text = f"{opt}) {q['options'][idx]}"
                     if user_answers[i] == opt:
                         if is_correct:
-                            st.markdown(f"<span style='color: green; font-weight: bold'>Your answer: {option_text} ✔️</span>", unsafe_allow_html=True)
+                            st.markdown(f"<span style='color: green; font-weight: bold'>Your answer: {option_text} ✔</span>", unsafe_allow_html=True)
                         else:
                             st.markdown(f"<span style='color: red; font-weight: bold'>Your answer: {option_text} ❌</span>", unsafe_allow_html=True)
                     elif not is_correct and q['answer'] == opt:
-                        st.markdown(f"<span style='color: green; font-weight: bold'>Correct answer: {option_text} ✔️</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span style='color: green; font-weight: bold'>Correct answer: {option_text} ✔</span>", unsafe_allow_html=True)
                     else:
                         st.markdown(f"{option_text}")
                 st.markdown('---')
