@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex
+from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex, FilterSelector
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
@@ -185,7 +185,12 @@ def get_existing_embeddings(pdf_hash):
 def clear_all_embeddings():
     """Clear all embeddings from Qdrant collection"""
     try:
-        qdrant_client.delete_collection(COLLECTION_NAME)
+        # Clear all payloads from the collection without deleting the points or collection itself
+        qdrant_client.clear_payload(
+            collection_name=COLLECTION_NAME,
+            points_selector=FilterSelector(filter=Filter()),
+            wait=True
+        )
         st.success("All embeddings cleared successfully.")
         return True
     except Exception as e:
