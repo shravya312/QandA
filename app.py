@@ -288,7 +288,7 @@ def search_chunks(query_text, pdf_hash):
         qdrant_results = qdrant_client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=10, # Get more candidates for re-ranking
+            limit=20, # Get more candidates for re-ranking
             query_filter=models.Filter(
                 must=[models.FieldCondition(key="pdf_hash", match=models.MatchValue(value=pdf_hash))]
             )
@@ -332,11 +332,41 @@ def search_chunks(query_text, pdf_hash):
         
         # Sort and return top chunks
         sorted_chunks = sorted(combined_scores.items(), key=lambda item: item[1], reverse=True)
-        return [chunk for chunk, score in sorted_chunks[:5]]
+        return [chunk for chunk, score in sorted_chunks[:20]]
 
     except Exception as e:
         st.error(f"Error performing hybrid search: {str(e)}")
         return []
+
+def re_rank_chunks(query_text, candidate_chunks, top_k=5):
+    """Re-ranks candidate chunks based on semantic similarity to the query."""
+    if not candidate_chunks:
+        return []
+
+    # Encode query and candidate chunks
+    query_embedding = model.encode([query_text])[0]
+    chunk_embeddings = model.encode(candidate_chunks)
+
+    # Calculate cosine similarity between query and each chunk
+    # Using numpy's dot product for cosine similarity after normalization
+    query_embedding_norm = np.linalg.norm(query_embedding)
+    chunk_embeddings_norm = np.linalg.norm(chunk_embeddings, axis=1)
+
+    # Avoid division by zero for zero vectors
+    if query_embedding_norm == 0:
+        return []
+    chunk_embeddings_norm[chunk_embeddings_norm == 0] = 1e-12 # Small epsilon to avoid div by zero
+
+    similarities = np.dot(chunk_embeddings, query_embedding) / (chunk_embeddings_norm * query_embedding_norm)
+
+    # Pair chunks with their similarity scores
+    scored_chunks = list(zip(candidate_chunks, similarities))
+
+    # Sort by similarity score in descending order
+    scored_chunks.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top_k re-ranked chunks
+    return [chunk for chunk, score in scored_chunks[:top_k]]
 
 def generate_answer_from_gemini(query, context):
     """Use Gemini to answer the question"""
@@ -566,9 +596,15 @@ with qna_tab:
         st.info("🔍 Searching for relevant information...")
         query_vector = model.encode([question])[0]
         current_pdf_hash = st.session_state.get('pdf_hash')
-        context_chunks = search_chunks(question, current_pdf_hash) if current_pdf_hash else []
-        st.session_state.context_chunks = context_chunks
-        context = " ".join(context_chunks)
+        
+        # Perform hybrid search to get candidate chunks
+        candidate_chunks = search_chunks(question, current_pdf_hash) if current_pdf_hash else []
+        
+        # Re-rank the candidate chunks
+        re_ranked_chunks = re_rank_chunks(question, candidate_chunks, top_k=5)
+        
+        st.session_state.context_chunks = re_ranked_chunks
+        context = " ".join(re_ranked_chunks)
         st.info("🤖 Generating answer from Gemini...")
         answer = generate_answer_from_gemini(question, context)
         st.subheader("🧠 Answer:")
