@@ -411,7 +411,6 @@ with st.sidebar:
     - This saves time and computational resources
     """)
 
-# Initialize session state
 if 'processed_pdf' not in st.session_state:
     st.session_state.processed_pdf = False
 if 'pdf_path' not in st.session_state:
