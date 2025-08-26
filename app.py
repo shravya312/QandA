@@ -3,8 +3,8 @@ import streamlit as st
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex
-from qdrant_client.models import PointStruct
-from sentence_transformers import SentenceTransformer
+from qdrant_client.models import PointStruct 
+from sentence_transformers import SentenceTransformer 
 from pypdf import PdfReader
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ import numpy as np
 import re
 import hashlib
 import uuid
+from rank_bm25 import BM25Okapi
 
 load_dotenv()
 
@@ -81,6 +82,10 @@ def chunk_text(text):
     if not text:
         return []
     return [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE) if text[i:i + CHUNK_SIZE].strip()]
+
+def tokenize_text(text):
+    """Tokenize text for BM25 processing."""
+    return text.lower().split()
 
 def get_embeddings(chunks):
     """Convert text chunks into embeddings"""
@@ -275,20 +280,62 @@ def upload_to_qdrant(chunks, embeddings, pdf_hash):
         st.error(f"Error uploading to Qdrant: {str(e)}")
         return False
 
-def search_chunks(query_vector, pdf_hash):
-    """Retrieve most relevant chunks for only the current PDF."""
+def search_chunks(query_text, pdf_hash):
+    """Retrieve most relevant chunks for only the current PDF using hybrid search."""
     try:
-        result = qdrant_client.search(
+        # --- Dense Retrieval (Qdrant) ---
+        query_vector = model.encode([query_text])[0]
+        qdrant_results = qdrant_client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=5,
-            query_filter=Filter(
-                must=[FieldCondition(key="pdf_hash", match=MatchValue(value=pdf_hash))]
+            limit=10, # Get more candidates for re-ranking
+            query_filter=models.Filter(
+                must=[models.FieldCondition(key="pdf_hash", match=models.MatchValue(value=pdf_hash))]
             )
         )
-        return [hit.payload.get("text", "") for hit in result]
+        dense_hits = {hit.payload.get("text", ""): hit.score for hit in qdrant_results}
+
+        # --- Sparse Retrieval (BM25) ---
+        if 'bm25_model' in st.session_state and 'tokenized_chunks' in st.session_state:
+            bm25_model = st.session_state.bm25_model
+            tokenized_chunks = st.session_state.tokenized_chunks
+            tokenized_query = tokenize_text(query_text)
+            bm25_scores = bm25_model.get_scores(tokenized_query)
+            
+            # Pair scores with original chunks and filter by pdf_hash
+            sparse_hits = {}
+            for i, score in enumerate(bm25_scores):
+                original_chunk = st.session_state.chunks[i]
+                # Assuming pdf_hash is also implicitly in the stored chunks for validation if needed
+                if score > 0: # Only consider chunks with a positive BM25 score
+                    sparse_hits[original_chunk] = score
+        else:
+            sparse_hits = {}
+
+        # --- Hybrid Scoring ---
+        combined_scores = {}
+        alpha = 0.5 # Weight for dense vs sparse
+
+        all_chunks = set(dense_hits.keys()).union(set(sparse_hits.keys()))
+
+        if not all_chunks: # If no chunks from either, return empty
+            return []
+        
+        # Normalize scores (simple min-max for now, can be improved)
+        max_dense_score = max(dense_hits.values()) if dense_hits else 1.0
+        max_sparse_score = max(sparse_hits.values()) if sparse_hits else 1.0
+
+        for chunk in all_chunks:
+            dense_score = dense_hits.get(chunk, 0.0) / max_dense_score
+            sparse_score = sparse_hits.get(chunk, 0.0) / max_sparse_score
+            combined_scores[chunk] = (alpha * dense_score) + ((1 - alpha) * sparse_score)
+        
+        # Sort and return top chunks
+        sorted_chunks = sorted(combined_scores.items(), key=lambda item: item[1], reverse=True)
+        return [chunk for chunk, score in sorted_chunks[:5]]
+
     except Exception as e:
-        st.error(f"Error searching chunks: {str(e)}")
+        st.error(f"Error performing hybrid search: {str(e)}")
         return []
 
 def generate_answer_from_gemini(query, context):
@@ -486,6 +533,10 @@ if pdf and not st.session_state.processed_pdf:
                 if text:
                     chunks = chunk_text(text)
                     st.session_state.chunks = chunks
+                    tokenized_chunks = [tokenize_text(chunk) for chunk in chunks]
+                    bm25_model = BM25Okapi(tokenized_chunks)
+                    st.session_state.bm25_model = bm25_model
+                    st.session_state.tokenized_chunks = tokenized_chunks
                     embeddings = get_embeddings(chunks)
             
             # Upload to Qdrant only if we created new embeddings in this run
@@ -515,7 +566,7 @@ with qna_tab:
         st.info("🔍 Searching for relevant information...")
         query_vector = model.encode([question])[0]
         current_pdf_hash = st.session_state.get('pdf_hash')
-        context_chunks = search_chunks(query_vector, current_pdf_hash) if current_pdf_hash else []
+        context_chunks = search_chunks(question, current_pdf_hash) if current_pdf_hash else []
         st.session_state.context_chunks = context_chunks
         context = " ".join(context_chunks)
         st.info("🤖 Generating answer from Gemini...")
