@@ -1,7 +1,8 @@
 import os
 import streamlit as st
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex, FilterSelector
+from qdrant_client.http import models
+from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue, PayloadSchemaType, CreateFieldIndex
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
@@ -14,10 +15,9 @@ import re
 import hashlib
 import uuid
 
-# ===== Load Environment Variables =====
 load_dotenv()
 
-# ===== Configuration =====
+
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -182,20 +182,21 @@ def get_existing_embeddings(pdf_hash):
         st.error(f"Error retrieving existing embeddings: {str(e)}")
         return [], None
 
+from qdrant_client.http import models
+
 def clear_all_embeddings():
-    """Clear all embeddings from Qdrant collection"""
     try:
-        # Clear all payloads from the collection without deleting the points or collection itself
-        qdrant_client.clear_payload(
+        qdrant_client.delete(
             collection_name=COLLECTION_NAME,
-            points_selector=FilterSelector(filter=Filter()),
-            wait=True
+            points_selector=models.FilterSelector(
+                filter=models.Filter(must=[])  # empty filter ⇒ match all points
+            )
         )
-        st.success("All embeddings cleared successfully.")
-        return True
+        print("🗑️ Cleared all embeddings and payloads from collection")
     except Exception as e:
-        st.error(f"Error clearing embeddings: {str(e)}")
-        return False
+        print(f"Error clearing embeddings: {e}")
+
+
 
 def recreate_collection_with_schema():
     """Recreate collection with proper payload schema"""
@@ -510,6 +511,7 @@ with qna_tab:
     st.header("Ask a Question from the PDF")
     question = st.text_input("Ask a question based on the PDF content:")
     if question and st.session_state.processed_pdf:
+        
         st.info("🔍 Searching for relevant information...")
         query_vector = model.encode([question])[0]
         current_pdf_hash = st.session_state.get('pdf_hash')
