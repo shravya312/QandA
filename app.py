@@ -201,7 +201,25 @@ def clear_all_embeddings():
     except Exception as e:
         print(f"Error clearing embeddings: {e}")
 
-
+def load_all_chunks_for_bm25():
+    """Loads all chunks from Qdrant to build a global BM25 model."""
+    try:
+        scroll_result, _ = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100000,  # Adjust limit as needed for total number of chunks
+            with_payload=True,
+            with_vectors=False
+        )
+        all_chunks = [point.payload.get("text", "") for point in scroll_result if point.payload.get("text")]
+        if all_chunks:
+            tokenized_all_chunks = [tokenize_text(chunk) for chunk in all_chunks]
+            st.session_state.bm25_model = BM25Okapi(tokenized_all_chunks)
+            st.session_state.all_chunks = all_chunks # Store original chunks for retrieval
+            st.info("BM25 model initialized with all existing chunks.")
+        else:
+            st.info("No chunks found in Qdrant for BM25 initialization.")
+    except Exception as e:
+        st.error(f"Error loading all chunks for BM25: {str(e)}")
 
 def recreate_collection_with_schema():
     """Recreate collection with proper payload schema"""
@@ -248,6 +266,7 @@ def recreate_collection_with_schema():
             return False
 
         st.success("Collection recreated and pdf_hash index validated.")
+        load_all_chunks_for_bm25()
         return True
     except Exception as e:
         st.error(f"Error recreating collection: {str(e)}")
@@ -280,8 +299,8 @@ def upload_to_qdrant(chunks, embeddings, pdf_hash):
         st.error(f"Error uploading to Qdrant: {str(e)}")
         return False
 
-def search_chunks(query_text, pdf_hash):
-    """Retrieve most relevant chunks for only the current PDF using hybrid search."""
+def search_chunks(query_text):
+    """Retrieve most relevant chunks from all available PDFs using hybrid search."""
     try:
         # --- Dense Retrieval (Qdrant) ---
         query_vector = model.encode([query_text])[0]
@@ -289,24 +308,20 @@ def search_chunks(query_text, pdf_hash):
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
             limit=20, # Get more candidates for re-ranking
-            query_filter=models.Filter(
-                must=[models.FieldCondition(key="pdf_hash", match=models.MatchValue(value=pdf_hash))]
-            )
         )
         dense_hits = {hit.payload.get("text", ""): hit.score for hit in qdrant_results}
 
         # --- Sparse Retrieval (BM25) ---
-        if 'bm25_model' in st.session_state and 'tokenized_chunks' in st.session_state:
+        if 'bm25_model' in st.session_state and 'all_chunks' in st.session_state:
             bm25_model = st.session_state.bm25_model
-            tokenized_chunks = st.session_state.tokenized_chunks
+            all_chunks = st.session_state.all_chunks
             tokenized_query = tokenize_text(query_text)
             bm25_scores = bm25_model.get_scores(tokenized_query)
             
-            # Pair scores with original chunks and filter by pdf_hash
+            # Pair scores with original chunks
             sparse_hits = {}
             for i, score in enumerate(bm25_scores):
-                original_chunk = st.session_state.chunks[i]
-                # Assuming pdf_hash is also implicitly in the stored chunks for validation if needed
+                original_chunk = all_chunks[i]
                 if score > 0: # Only consider chunks with a positive BM25 score
                     sparse_hits[original_chunk] = score
         else:
@@ -348,7 +363,7 @@ def re_rank_chunks(query_text, candidate_chunks, top_k=5):
     chunk_embeddings = model.encode(candidate_chunks)
 
     # Calculate cosine similarity between query and each chunk
-    # Using numpy's dot product for cosine similarity after normalization
+    # Using numpy's dot product for cosine similarity after normalization in re_rank_chunks
     query_embedding_norm = np.linalg.norm(query_embedding)
     chunk_embeddings_norm = np.linalg.norm(chunk_embeddings, axis=1)
 
@@ -521,6 +536,10 @@ if 'text' not in st.session_state:
 if 'chunks' not in st.session_state:
     st.session_state.chunks = []
 
+# Initialize Qdrant and BM25 on startup
+if setup_collection():
+    load_all_chunks_for_bm25()
+
 pdf = st.file_uploader("Upload a PDF file", type=["pdf"])
 
 # Detect if a new PDF is uploaded and reset session state
@@ -549,7 +568,7 @@ if pdf and not st.session_state.processed_pdf:
         if not pdf_hash:
             st.error("Failed to generate PDF hash.")
         else:
-            # Persist current pdf hash for scoping searches
+            # Store pdf hash for checking existing embeddings
             st.session_state.pdf_hash = pdf_hash
             st.info("⏳ Checking for existing embeddings...")
             
@@ -590,6 +609,7 @@ if pdf and not st.session_state.processed_pdf:
                 if upload_to_qdrant(chunks, embeddings, pdf_hash):
                     st.session_state.processed_pdf = True
                     st.success("✅ PDF processed and indexed.")
+                    load_all_chunks_for_bm25() # Reload BM25 with new chunks
                 else:
                     st.error("Failed to upload embeddings to Qdrant.")
             elif not st.session_state.processed_pdf and (not chunks or not is_valid_embeddings(embeddings)):
@@ -614,10 +634,9 @@ with qna_tab:
         
         st.info("🔍 Searching for relevant information...")
         # query_vector = model.encode([question])[0] # No longer needed, search_chunks takes text
-        current_pdf_hash = st.session_state.get('pdf_hash')
         
         # Perform hybrid search to get candidate chunks
-        candidate_chunks = search_chunks(expanded_query_text, current_pdf_hash) if current_pdf_hash else []
+        candidate_chunks = search_chunks(expanded_query_text)
         
         # Re-rank the candidate chunks
         re_ranked_chunks = re_rank_chunks(expanded_query_text, candidate_chunks, top_k=5)
