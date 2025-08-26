@@ -96,7 +96,7 @@ def is_valid_embeddings(embeddings):
         return False
     if isinstance(embeddings, np.ndarray):
         return embeddings.size > 0
-    if hasattr(embeddings, '_len_'):
+    if hasattr(embeddings, '__len__'):
         return len(embeddings) > 0
     return False
 
@@ -269,15 +269,18 @@ def upload_to_qdrant(chunks, embeddings, pdf_hash):
         st.error(f"Error uploading to Qdrant: {str(e)}")
         return False
 
-def search_chunks(query_vector):
-    """Retrieve most relevant chunks"""
+def search_chunks(query_vector, pdf_hash):
+    """Retrieve most relevant chunks for only the current PDF."""
     try:
         result = qdrant_client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=5
+            limit=5,
+            query_filter=Filter(
+                must=[FieldCondition(key="pdf_hash", match=MatchValue(value=pdf_hash))]
+            )
         )
-        return [hit.payload["text"] for hit in result]
+        return [hit.payload.get("text", "") for hit in result]
     except Exception as e:
         st.error(f"Error searching chunks: {str(e)}")
         return []
@@ -448,6 +451,8 @@ if pdf and not st.session_state.processed_pdf:
         if not pdf_hash:
             st.error("Failed to generate PDF hash.")
         else:
+            # Persist current pdf hash for scoping searches
+            st.session_state.pdf_hash = pdf_hash
             st.info("⏳ Checking for existing embeddings...")
             
             # Check if embeddings already exist
@@ -503,7 +508,8 @@ with qna_tab:
     if question and st.session_state.processed_pdf:
         st.info("🔍 Searching for relevant information...")
         query_vector = model.encode([question])[0]
-        context_chunks = search_chunks(query_vector)
+        current_pdf_hash = st.session_state.get('pdf_hash')
+        context_chunks = search_chunks(query_vector, current_pdf_hash) if current_pdf_hash else []
         st.session_state.context_chunks = context_chunks
         context = " ".join(context_chunks)
         st.info("🤖 Generating answer from Gemini...")
