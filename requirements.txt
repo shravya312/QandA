@@ -1,0 +1,8 @@
+streamlit
+qdrant-client
+sentence-transformers
+pypdf
+google-generativeai
+python-dotenv
+numpy
+rank_bm25 
